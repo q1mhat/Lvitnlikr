@@ -1,0 +1,311 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "LiveLiker"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.liveliker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.liveliker"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoTapService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="app_name">لايكات البث</string>
+              <string name="service_desc">يرسل نقرات متكررة في المكان الذي تحدده على الشاشة.</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/liveliker
+          cat > app/src/main/java/com/example/liveliker/MainActivity.kt <<'EOF_FILE'
+          package com.example.liveliker
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "طريقة الاستخدام:\n\n" +
+                          "1) اضغط الزر الأول وفعّل خدمة «لايكات البث» من إعدادات إمكانية الوصول.\n" +
+                          "2) افتح بث تيك توك.\n" +
+                          "3) اسحب الدائرة الحمراء إلى المكان الذي تريد النقر عليه (زر القلب أو منتصف الشاشة).\n" +
+                          "4) اضغط ▶ للبدء و ⏸ للإيقاف. أزرار + و − تتحكم بالسرعة."
+                      textSize = 16f
+                      setTextColor(Color.DKGRAY)
+                      textDirection = TextView.TEXT_DIRECTION_RTL
+                  })
+                  root.addView(Button(this).apply {
+                      text = "١) فتح إعدادات إمكانية الوصول"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "إظهار أزرار التحكم"
+                      setOnClickListener { AutoTapService.instance?.showOverlay() }
+                  })
+                  setContentView(root)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/liveliker
+          cat > app/src/main/java/com/example/liveliker/AutoTapService.kt <<'EOF_FILE'
+          package com.example.liveliker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.random.Random
+
+          class AutoTapService : AccessibilityService() {
+
+              companion object { var instance: AutoTapService? = null }
+
+              private lateinit var wm: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var panel: LinearLayout? = null
+              private var target: View? = null
+              private lateinit var targetLp: WindowManager.LayoutParams
+              private lateinit var toggleBtn: Button
+              private lateinit var label: TextView
+
+              private var running = false
+              private var intervalMs = 500L
+              private val targetSize get() = (56 * resources.displayMetrics.density).toInt()
+
+              private val tapRunnable = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      val half = targetSize / 2f
+                      val x = targetLp.x + half + Random.nextInt(-6, 7)
+                      val y = targetLp.y + half + Random.nextInt(-6, 7)
+                      val path = Path().apply { moveTo(x, y) }
+                      val stroke = GestureDescription.StrokeDescription(path, 0, 40)
+                      dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+                      val jitter = (intervalMs * Random.nextDouble(0.85, 1.15)).toLong()
+                      handler.postDelayed(this, jitter)
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  showOverlay()
+              }
+
+              fun showOverlay() {
+                  if (panel != null) return
+                  buildTarget()
+                  buildPanel()
+              }
+
+              private fun hideOverlay() {
+                  stopTapping()
+                  panel?.let { wm.removeView(it) }
+                  target?.let { wm.removeView(it) }
+                  panel = null; target = null
+              }
+
+              private fun overlayParams(w: Int, h: Int, touchable: Boolean = true) =
+                  WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START }
+
+              private fun buildTarget() {
+                  val v = View(this).apply {
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.argb(140, 255, 40, 80))
+                          setStroke(4, Color.WHITE)
+                      }
+                  }
+                  targetLp = overlayParams(targetSize, targetSize).apply {
+                      x = resources.displayMetrics.widthPixels / 2 - targetSize / 2
+                      y = resources.displayMetrics.heightPixels / 2
+                  }
+                  v.setOnTouchListener { _, e ->
+                      if (!running && e.action == MotionEvent.ACTION_MOVE) {
+                          targetLp.x = (e.rawX - targetSize / 2).toInt()
+                          targetLp.y = (e.rawY - targetSize / 2).toInt()
+                          wm.updateViewLayout(v, targetLp)
+                      }
+                      true
+                  }
+                  wm.addView(v, targetLp)
+                  target = v
+              }
+
+              private fun buildPanel() {
+                  val d = resources.displayMetrics.density
+                  val p = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding((8 * d).toInt(), (4 * d).toInt(), (8 * d).toInt(), (4 * d).toInt())
+                      background = GradientDrawable().apply {
+                          cornerRadius = 28 * d
+                          setColor(Color.argb(210, 20, 20, 20))
+                      }
+                  }
+                  fun btn(t: String, onClick: () -> Unit) = Button(this).apply {
+                      text = t; setTextColor(Color.WHITE); setBackgroundColor(Color.TRANSPARENT)
+                      minWidth = 0; minimumWidth = 0
+                      setOnClickListener { onClick() }
+                  }
+                  toggleBtn = btn("▶") { if (running) stopTapping() else startTapping() }
+                  label = TextView(this).apply { setTextColor(Color.WHITE); updateLabel() }
+                  p.addView(toggleBtn)
+                  p.addView(btn("−") { intervalMs = (intervalMs + 100).coerceAtMost(3000); updateLabel() })
+                  p.addView(label)
+                  p.addView(btn("+") { intervalMs = (intervalMs - 100).coerceAtLeast(200); updateLabel() })
+                  p.addView(btn("✕") { hideOverlay() })
+
+                  val lp = overlayParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT)
+                      .apply { gravity = Gravity.TOP or Gravity.END; y = (160 * d).toInt() }
+                  wm.addView(p, lp)
+                  panel = p
+              }
+
+              private fun updateLabel() { label.text = " ${intervalMs}ms " }
+
+              private fun startTapping() {
+                  running = true
+                  toggleBtn.text = "⏸"
+                  targetLp.flags = targetLp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  target?.let { wm.updateViewLayout(it, targetLp) }
+                  handler.post(tapRunnable)
+              }
+
+              private fun stopTapping() {
+                  running = false
+                  handler.removeCallbacks(tapRunnable)
+                  if (panel != null) toggleBtn.text = "▶"
+                  target?.let {
+                      targetLp.flags = targetLp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                      wm.updateViewLayout(it, targetLp)
+                  }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() { stopTapping() }
+              override fun onDestroy() { hideOverlay(); instance = null; super.onDestroy() }
+          }
+          EOF_FILE
+          echo 'android.useAndroidX=true' > gradle.properties
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveLiker-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
